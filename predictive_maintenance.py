@@ -52,6 +52,24 @@ class SensorDataCleaner:
 
     def validate_reading(self, reading: np.ndarray) -> list[str]:
         """Report sensor readings that are missing or outside configured limits."""
+        issues = self.validate_numeric_reading(reading)
+        if issues:
+            return issues
+        return self.sensor_limit_issues(reading)
+
+    def validate_numeric_reading(self, reading: np.ndarray) -> list[str]:
+        """Report readings that are missing or not finite."""
+        values = np.asarray(reading, dtype=float).reshape(-1)
+        if values.size != len(self.SENSOR_LIMITS):
+            raise ValueError(f"Expected {len(self.SENSOR_LIMITS)} sensor values.")
+        return [
+            f"{sensor} reading is missing or not finite."
+            for sensor, value in zip(self.SENSOR_LIMITS, values)
+            if not np.isfinite(value)
+        ]
+
+    def sensor_limit_issues(self, reading: np.ndarray) -> list[str]:
+        """Report readings outside configured physical sensor limits."""
         values = np.asarray(reading, dtype=float).reshape(-1)
         if values.size != len(self.SENSOR_LIMITS):
             raise ValueError(f"Expected {len(self.SENSOR_LIMITS)} sensor values.")
@@ -59,14 +77,26 @@ class SensorDataCleaner:
         issues = []
         for index, (sensor, (minimum, maximum)) in enumerate(self.SENSOR_LIMITS.items()):
             value = values[index]
-            if not np.isfinite(value):
-                issues.append(f"{sensor} reading is missing or not finite.")
-            elif value < minimum or value > maximum:
+            if value < minimum or value > maximum:
                 issues.append(
                     f"{sensor} reading {value:g} is outside the configured "
                     f"sensor range ({minimum:g} to {maximum:g})."
                 )
         return issues
+
+    def out_of_sensor_range_indices(self, reading: np.ndarray) -> set[int]:
+        """Return indices of finite readings outside their configured limits."""
+        values = np.asarray(reading, dtype=float).reshape(-1)
+        if values.size != len(self.SENSOR_LIMITS):
+            raise ValueError(f"Expected {len(self.SENSOR_LIMITS)} sensor values.")
+        return {
+            index
+            for index, (value, (minimum, maximum)) in enumerate(
+                zip(values, self.SENSOR_LIMITS.values())
+            )
+            if np.isfinite(value)
+            and (value < minimum or value > maximum)
+        }
 
 
 class PredictiveMaintenanceModel:
@@ -88,6 +118,8 @@ class PredictiveMaintenanceModel:
         )
         self.normal_mean: np.ndarray | None = None
         self.normal_std: np.ndarray | None = None
+        self.normal_lower: np.ndarray | None = None
+        self.normal_upper: np.ndarray | None = None
 
     def fit(self, features: np.ndarray, labels: np.ndarray) -> None:
         self.model.fit(features, labels)
@@ -97,6 +129,9 @@ class PredictiveMaintenanceModel:
         self.normal_mean = np.mean(normal_features, axis=0)
         self.normal_std = np.std(normal_features, axis=0)
         self.normal_std[self.normal_std == 0] = 1.0
+        self.normal_lower, self.normal_upper = np.percentile(
+            normal_features, [2.5, 97.5], axis=0
+        )
 
     def predict(self, features: np.ndarray) -> np.ndarray:
         return self.model.predict(features)
@@ -119,6 +154,25 @@ class PredictiveMaintenanceModel:
     def health_score(self, anomaly_scores: np.ndarray) -> float:
         """Map the average absolute sensor deviation to a simple 0–100 score."""
         return float(100 / (1 + np.mean(anomaly_scores)))
+
+    def expected_range(self, sensor_index: int) -> tuple[float, float]:
+        """Return the central 95% range observed for a healthy sensor."""
+        if self.normal_lower is None or self.normal_upper is None:
+            raise RuntimeError("Train the model before requesting expected ranges.")
+        return (
+            float(self.normal_lower[sensor_index]),
+            float(self.normal_upper[sensor_index]),
+        )
+
+    def operating_status(self, reading: np.ndarray, sensor_index: int) -> str:
+        """Classify a reading against its learned healthy operating range."""
+        value = float(np.asarray(reading, dtype=float).reshape(-1)[sensor_index])
+        lower, upper = self.expected_range(sensor_index)
+        if value < lower:
+            return "low"
+        if value > upper:
+            return "high"
+        return "normal"
 
     def evaluate(self, features: np.ndarray, labels: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         predictions = self.predict(features)
@@ -172,6 +226,19 @@ class PredictiveMaintenanceModel:
                         "deviations per hour)."
                     )
 
+        statuses = [
+            self.operating_status(reading, index)
+            for index in range(len(self.FEATURE_NAMES))
+        ]
+        for index, status in enumerate(statuses):
+            if status != "normal":
+                lower, upper = self.expected_range(index)
+                direction = "below" if status == "low" else "above"
+                alerts.append(
+                    f"{self.FEATURE_NAMES[index]} is {direction} its expected "
+                    f"healthy range ({lower:g} to {upper:g})."
+                )
+
         colors = [
             "crimson" if index in rapidly_worsening
             else "darkorange" if score >= outlier_threshold
@@ -181,8 +248,8 @@ class PredictiveMaintenanceModel:
         anomaly_indices = np.minimum(anomaly_scores / 6.0, 1.0) * 100
         chart_threshold = min(outlier_threshold / 6.0, 1.0) * 100
 
-        figure, (probability_axis, sensor_axis) = plt.subplots(
-            1, 2, figsize=(12, 5), gridspec_kw={"width_ratios": [1, 1.5]}
+        figure, (probability_axis, sensor_axis, range_axis) = plt.subplots(
+            1, 3, figsize=(18, 6), gridspec_kw={"width_ratios": [1, 1.3, 1.7]}
         )
         probability_axis.barh(["Failure likelihood"], [probability * 100], color="crimson")
         probability_axis.set_xlim(0, 100)
@@ -205,6 +272,57 @@ class PredictiveMaintenanceModel:
             Patch(color="steelblue", label="Within range"),
             Line2D([0], [0], color="darkorange", linestyle="--", label="Outlier threshold"),
         ])
+
+        sensor_limits = list(SensorDataCleaner.SENSOR_LIMITS.values())
+        out_of_range = {
+            index
+            for index, value in enumerate(reading.reshape(-1))
+            if value < sensor_limits[index][0] or value > sensor_limits[index][1]
+        }
+        for index, (value, status) in enumerate(zip(reading.reshape(-1), statuses)):
+            minimum, maximum = sensor_limits[index]
+            lower, upper = self.expected_range(index)
+            expected_start = np.clip((lower - minimum) / (maximum - minimum) * 100, 0, 100)
+            expected_end = np.clip((upper - minimum) / (maximum - minimum) * 100, 0, 100)
+            position = np.clip((value - minimum) / (maximum - minimum) * 100, 0, 100)
+            range_axis.barh(index, 100, color="gainsboro", height=0.55)
+            range_axis.barh(
+                index,
+                expected_end - expected_start,
+                left=expected_start,
+                color="palegreen",
+                height=0.55,
+            )
+            marker_color = {
+                "low": "gold",
+                "high": "crimson",
+                "normal": "forestgreen",
+            }[status]
+            range_axis.scatter(position, index, color=marker_color, s=55, zorder=3)
+            marker = index in out_of_range or status != "normal"
+            marker_label = f"{value:g}{'*' if marker else ''}"
+            range_axis.annotate(
+                marker_label,
+                (position, index),
+                xytext=(5 if position < 90 else -5, 8),
+                textcoords="offset points",
+                ha="left" if position < 90 else "right",
+                fontsize=8,
+            )
+
+        range_axis.set_yticks(range(len(self.FEATURE_NAMES)))
+        range_axis.set_yticklabels(self.FEATURE_NAMES)
+        range_axis.invert_yaxis()
+        range_axis.set_xlim(0, 100)
+        range_axis.set_xlabel("% of configured physical sensor range")
+        range_axis.set_title("Reading vs. healthy range (* = flagged)")
+        range_axis.legend(handles=[
+            Patch(color="gainsboro", label="Physical sensor range"),
+            Patch(color="palegreen", label="Expected healthy range"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="gold", label="Too low"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="crimson", label="Too high"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="forestgreen", label="In range"),
+        ], fontsize=8)
         figure.suptitle("Predictive Maintenance Assessment")
         figure.tight_layout()
         figure.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -258,18 +376,36 @@ def print_sensor_reading(
     sample_interval_hours: float,
 ) -> None:
     """Display one sensor's value, anomaly level, and trend alert."""
-    issues = cleaner.validate_reading(reading)
+    issues = cleaner.validate_numeric_reading(reading)
     if issues:
         print("Cannot assess this reading:")
         for issue in issues:
-            print(f"- ALERT: {issue}")
+            print(f"- {issue}")
         return
 
     anomaly_scores = model.sensor_anomalies(reading.reshape(1, -1))
     score = anomaly_scores[sensor_index]
     name = model.FEATURE_NAMES[sensor_index]
     value = reading[sensor_index]
-    print(f"{name}: {value:g}")
+    lower, upper = model.expected_range(sensor_index)
+    physical_issue = sensor_index in cleaner.out_of_sensor_range_indices(reading)
+    status = model.operating_status(reading, sensor_index)
+    issue = physical_issue or status != "normal"
+    print(f"{name}: {value:g}{'*' if issue else ''}")
+    print(f"Expected healthy range: {lower:g} to {upper:g}")
+    if physical_issue:
+        limit_issues = cleaner.sensor_limit_issues(reading)
+        matching_issue = next(
+            (item for item in limit_issues if item.startswith(f"{name} reading")), None
+        )
+        print(f"ALERT: {matching_issue} This reading is likely invalid.")
+
+    if status == "low":
+        print(f"ALERT: {name} is below its expected healthy range.")
+    elif status == "high":
+        print(f"ALERT: {name} is above its expected healthy range.")
+    else:
+        print(f"{name} is within its expected healthy range.")
     print(f"Deviation from normal: {score:.2f} standard deviations")
 
     if score >= 3.0:
@@ -277,7 +413,7 @@ def print_sensor_reading(
     else:
         print(f"{name} is not currently an outlier.")
 
-    if not cleaner.validate_reading(previous_reading):
+    if not cleaner.validate_numeric_reading(previous_reading):
         previous_score = model.sensor_anomalies(previous_reading.reshape(1, -1))[sensor_index]
         worsening_rate = (score - previous_score) / sample_interval_hours
         if worsening_rate >= 2.0:
@@ -285,6 +421,37 @@ def print_sensor_reading(
                 f"ALERT: {name} is worsening rapidly "
                 f"({worsening_rate:.2f} standard deviations per hour)."
             )
+
+
+def print_reading_ranges(
+    model: PredictiveMaintenanceModel,
+    cleaner: SensorDataCleaner,
+    reading: np.ndarray,
+) -> None:
+    """Display all current readings alongside expected and physical ranges."""
+    physical_issues = cleaner.out_of_sensor_range_indices(reading)
+    for index, name in enumerate(model.FEATURE_NAMES):
+        value = reading[index]
+        lower, upper = model.expected_range(index)
+        status = model.operating_status(reading, index)
+        status_text = {
+            "low": "TOO LOW",
+            "high": "TOO HIGH",
+            "normal": "within expected range",
+        }[status]
+        marker = "*" if index in physical_issues or status != "normal" else ""
+        print(
+            f"{name}: {value:g}{marker} "
+            f"(expected {lower:g} to {upper:g}) - {status_text}"
+        )
+
+    for issue in cleaner.sensor_limit_issues(reading):
+        print(f"ALERT: {issue} This reading is likely invalid.")
+    if physical_issues or any(
+        model.operating_status(reading, index) != "normal"
+        for index in range(len(model.FEATURE_NAMES))
+    ):
+        print("* indicates a reading outside its expected healthy range or physical limits.")
 
 
 def interactive_menu(
@@ -298,7 +465,14 @@ def interactive_menu(
     while True:
         print("\nChoose what to inspect:")
         for index, name in enumerate(model.FEATURE_NAMES, start=1):
-            print(f"{index}. {name}")
+            lower, upper = model.expected_range(index - 1)
+            status = model.operating_status(reading, index - 1)
+            physical_issue = index - 1 in cleaner.out_of_sensor_range_indices(reading)
+            marker = "*" if physical_issue or status != "normal" else ""
+            print(
+                f"{index}. {name}: {reading[index - 1]:g}{marker} "
+                f"(expected {lower:g} to {upper:g})"
+            )
         print("5. Overall engine health")
         print("6. All metrics and failure chart")
         print("7. Enter new sensor readings")
@@ -317,11 +491,12 @@ def interactive_menu(
                 sample_interval_hours,
             )
         elif choice == "5":
-            issues = cleaner.validate_reading(reading)
+            issues = cleaner.validate_numeric_reading(reading)
             if issues:
                 for issue in issues:
-                    print(f"ALERT: {issue}")
+                    print(issue)
                 continue
+            print_reading_ranges(model, cleaner, reading)
             anomalies = model.sensor_anomalies(reading.reshape(1, -1))
             health = model.health_score(anomalies)
             print(f"Overall engine health: {health:.1f}/100")
@@ -330,12 +505,14 @@ def interactive_menu(
                 f"average deviation is {np.mean(anomalies):.2f} standard deviations."
             )
         elif choice == "6":
-            issues = cleaner.validate_reading(reading)
-            previous_issues = cleaner.validate_reading(previous_reading)
+            issues = cleaner.validate_numeric_reading(reading)
+            previous_issues = cleaner.validate_numeric_reading(previous_reading)
             if issues or previous_issues:
                 for issue in issues + previous_issues:
-                    print(f"ALERT: {issue}")
+                    print(issue)
                 continue
+            print("\nCurrent sensor readings:")
+            print_reading_ranges(model, cleaner, reading)
             probability, strongest_sensor, alerts, health = model.create_assessment_chart(
                 reading,
                 previous_reading=previous_reading,
@@ -347,6 +524,29 @@ def interactive_menu(
                 f"Strongest sensor anomaly: {strongest_sensor} "
                 "(an indicator, not a confirmed mechanical root cause)."
             )
+            anomaly_scores = model.sensor_anomalies(reading.reshape(1, -1))
+            likely_issue_indices = {
+                index
+                for index, score in enumerate(anomaly_scores)
+                if score >= 3.0
+                or model.operating_status(reading, index) != "normal"
+            }
+            likely_issue_indices.update(
+                index
+                for index, name in enumerate(model.FEATURE_NAMES)
+                if any(
+                    alert.startswith(f"ALERT: {name} is worsening rapidly")
+                    for alert in alerts
+                )
+            )
+            if likely_issue_indices:
+                likely_cause = max(
+                    likely_issue_indices, key=lambda index: anomaly_scores[index]
+                )
+                print(
+                    f"Most likely contributor to the detected issue: "
+                    f"{model.FEATURE_NAMES[likely_cause]}."
+                )
             if alerts:
                 for alert in alerts:
                     print(alert if alert.startswith("ALERT:") else f"ALERT: {alert}")
@@ -354,25 +554,53 @@ def interactive_menu(
                 print("No sensor outliers or rapid deterioration detected.")
             print("Chart saved as failure_assessment.png")
         elif choice == "7":
-            print("Enter current readings:")
-            try:
-                new_reading = np.array([
-                    float(input(f"{name}: "))
-                    for name in model.FEATURE_NAMES
-                ])
-                interval = float(input("Hours since the previous reading: "))
-            except ValueError:
-                print("Enter numeric sensor values and a numeric interval.")
-                continue
-            issues = cleaner.validate_reading(new_reading)
-            if issues:
-                for issue in issues:
-                    print(f"ALERT: {issue}")
-                print("The reading was not applied. Check the sensor limits.")
-                continue
-            if interval <= 0:
-                print("The time interval must be greater than zero.")
-                continue
+            print("Enter current readings. Each shows its expected and physical ranges:")
+            new_values = []
+            for index, name in enumerate(model.FEATURE_NAMES):
+                expected_lower, expected_upper = model.expected_range(index)
+                physical_lower, physical_upper = cleaner.SENSOR_LIMITS[name]
+                while True:
+                    try:
+                        value = float(input(
+                            f"{name} (expected {expected_lower:g} to "
+                            f"{expected_upper:g}; sensor limits {physical_lower:g} "
+                            f"to {physical_upper:g}): "
+                        ))
+                    except ValueError:
+                        print("Enter a numeric sensor value.")
+                        continue
+
+                    if not np.isfinite(value):
+                        print("Enter a finite sensor value.")
+                        continue
+
+                    if value < physical_lower or value > physical_upper:
+                        print(
+                            f"ALERT: {value:g} is outside the configured "
+                            f"{name.lower()} sensor limits and is likely impossible."
+                        )
+                        proceed = input(
+                            "Run anyway with this value? Enter y to proceed; "
+                            "otherwise enter a new value: "
+                        ).strip().lower()
+                        if proceed not in {"y", "yes"}:
+                            continue
+                        print(f"{name} accepted with a warning; it will be marked *.")
+                    new_values.append(value)
+                    break
+
+            new_reading = np.asarray(new_values, dtype=float)
+            while True:
+                try:
+                    interval = float(input("Hours since the previous reading: "))
+                except ValueError:
+                    print("Enter a numeric time interval.")
+                    continue
+                if not np.isfinite(interval) or interval <= 0:
+                    print("The time interval must be a finite number greater than zero.")
+                    continue
+                break
+
             previous_reading = reading
             reading = new_reading
             sample_interval_hours = interval
