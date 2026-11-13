@@ -1,14 +1,21 @@
-import numpy as np
-import matplotlib.pyplot as plt
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+
+AUDIT_LOG_PATH = Path(__file__).with_name("maintenance_history.jsonl")
 
 
 @dataclass
@@ -103,6 +110,7 @@ class PredictiveMaintenanceModel:
     """Train a classifier to predict machine failure risk."""
 
     FEATURE_NAMES = ("Vibration", "Temperature", "Current", "Runtime")
+    HEALTH_WEIGHTS = np.array([1.5, 1.5, 1.25, 0.75])
 
     def __init__(self):
         self.model = Pipeline(
@@ -152,8 +160,18 @@ class PredictiveMaintenanceModel:
         return np.abs((imputed[0] - self.normal_mean) / self.normal_std)
 
     def health_score(self, anomaly_scores: np.ndarray) -> float:
-        """Map the average absolute sensor deviation to a simple 0–100 score."""
-        return float(100 / (1 + np.mean(anomaly_scores)))
+        """Return a weighted 0–100 score from standardized sensor deviations."""
+        scores = np.asarray(anomaly_scores, dtype=float).reshape(-1)
+        if (
+            scores.size != len(self.FEATURE_NAMES)
+            or not np.all(np.isfinite(scores))
+            or np.any(scores < 0)
+        ):
+            raise ValueError(
+                "Health scoring requires one finite, non-negative anomaly score per sensor."
+            )
+        weighted_deviation = np.average(scores, weights=self.HEALTH_WEIGHTS)
+        return float(100 / (1 + weighted_deviation))
 
     def expected_range(self, sensor_index: int) -> tuple[float, float]:
         """Return the central 95% range observed for a healthy sensor."""
@@ -249,7 +267,7 @@ class PredictiveMaintenanceModel:
         chart_threshold = min(outlier_threshold / 6.0, 1.0) * 100
 
         figure, (probability_axis, sensor_axis, range_axis) = plt.subplots(
-            1, 3, figsize=(18, 6), gridspec_kw={"width_ratios": [1, 1.3, 1.7]}
+            1, 3, figsize=(18, 6), gridspec_kw={"width_ratios": [0.8, 1.1, 2.1]}
         )
         probability_axis.barh(["Failure likelihood"], [probability * 100], color="crimson")
         probability_axis.set_xlim(0, 100)
@@ -280,44 +298,53 @@ class PredictiveMaintenanceModel:
             if value < sensor_limits[index][0] or value > sensor_limits[index][1]
         }
         for index, (value, status) in enumerate(zip(reading.reshape(-1), statuses)):
-            minimum, maximum = sensor_limits[index]
             lower, upper = self.expected_range(index)
-            expected_start = np.clip((lower - minimum) / (maximum - minimum) * 100, 0, 100)
-            expected_end = np.clip((upper - minimum) / (maximum - minimum) * 100, 0, 100)
-            position = np.clip((value - minimum) / (maximum - minimum) * 100, 0, 100)
-            range_axis.barh(index, 100, color="gainsboro", height=0.55)
-            range_axis.barh(
-                index,
-                expected_end - expected_start,
-                left=expected_start,
-                color="palegreen",
-                height=0.55,
-            )
+            midpoint = (lower + upper) / 2
+            half_width = (upper - lower) / 2
+            if half_width == 0:
+                half_width = self.normal_std[index]
+            position = (value - midpoint) / half_width
+            visible_position = np.clip(position, -2, 2)
             marker_color = {
                 "low": "gold",
                 "high": "crimson",
                 "normal": "forestgreen",
             }[status]
-            range_axis.scatter(position, index, color=marker_color, s=55, zorder=3)
+            range_axis.barh(index, 4, left=-2, color="gainsboro", height=0.55)
+            range_axis.barh(index, 2, left=-1, color="palegreen", height=0.55)
+            range_axis.scatter(
+                visible_position,
+                index,
+                color=marker_color,
+                marker=">" if position > 2 else "<" if position < -2 else "o",
+                s=55,
+                zorder=3,
+            )
             marker = index in out_of_range or status != "normal"
             marker_label = f"{value:g}{'*' if marker else ''}"
             range_axis.annotate(
                 marker_label,
-                (position, index),
-                xytext=(5 if position < 90 else -5, 8),
+                (visible_position, index),
+                xytext=(5 if visible_position < 1.7 else -5, 8),
                 textcoords="offset points",
-                ha="left" if position < 90 else "right",
+                ha="left" if visible_position < 1.7 else "right",
                 fontsize=8,
             )
 
         range_axis.set_yticks(range(len(self.FEATURE_NAMES)))
         range_axis.set_yticklabels(self.FEATURE_NAMES)
         range_axis.invert_yaxis()
-        range_axis.set_xlim(0, 100)
-        range_axis.set_xlabel("% of configured physical sensor range")
-        range_axis.set_title("Reading vs. healthy range (* = flagged)")
+        range_axis.set_xlim(-2, 2)
+        range_axis.set_xticks(
+            [-2, -1, 0, 1, 2],
+            ["-2x", "low edge", "midpoint", "high edge", "+2x"],
+        )
+        range_axis.set_xlabel(
+            "Distance from each healthy midpoint (healthy range = -1x to +1x)"
+        )
+        range_axis.set_title("Centered healthy ranges (* = flagged)")
         range_axis.legend(handles=[
-            Patch(color="gainsboro", label="Physical sensor range"),
+            Patch(color="gainsboro", label="Display span (±2 healthy half-ranges)"),
             Patch(color="palegreen", label="Expected healthy range"),
             Line2D([0], [0], marker="o", color="w", markerfacecolor="gold", label="Too low"),
             Line2D([0], [0], marker="o", color="w", markerfacecolor="crimson", label="Too high"),
@@ -330,6 +357,77 @@ class PredictiveMaintenanceModel:
         plt.close(figure)
 
         return probability, strongest_sensor, alerts, health
+
+
+def append_audit_record(
+    model: PredictiveMaintenanceModel,
+    reading: np.ndarray,
+    source: str,
+    event: str,
+    alerts: list[str] | None = None,
+    log_path: Path = AUDIT_LOG_PATH,
+) -> None:
+    """Persist a diagnostic snapshot as one JSON Lines audit record."""
+    values = np.asarray(reading, dtype=float).reshape(-1)
+    if values.size != len(model.FEATURE_NAMES) or not np.all(np.isfinite(values)):
+        raise ValueError("Audit logging requires one finite reading per sensor.")
+    anomaly_scores = model.sensor_anomalies(values.reshape(1, -1))
+    record = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "event": event,
+        "sensor_readings": dict(zip(model.FEATURE_NAMES, values.tolist())),
+        "anomaly_scores_standard_deviations": dict(
+            zip(model.FEATURE_NAMES, anomaly_scores.tolist())
+        ),
+        "failure_probability": model.failure_probability(values.reshape(1, -1)),
+        "overall_health": model.health_score(anomaly_scores),
+        "alerts": alerts or [],
+    }
+    try:
+        with log_path.open("a", encoding="utf-8") as audit_file:
+            audit_file.write(json.dumps(record, allow_nan=False) + "\n")
+    except OSError as error:
+        raise OSError(
+            f"Unable to append the audit record to {log_path}: {error}"
+        ) from error
+
+
+def read_audit_history(log_path: Path = AUDIT_LOG_PATH) -> list[dict]:
+    """Load persisted diagnostic records in chronological order."""
+    try:
+        with log_path.open("r", encoding="utf-8") as audit_file:
+            return [json.loads(line) for line in audit_file if line.strip()]
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Unable to read audit history from {log_path}: {error}"
+        ) from error
+
+
+def print_audit_history(log_path: Path = AUDIT_LOG_PATH) -> None:
+    """Display persisted diagnostic readings and assessment results."""
+    records = read_audit_history(log_path)
+    if not records:
+        print(f"No audit history found at {log_path}.")
+        return
+    print(f"\nAudit history ({log_path}):")
+    for record in records:
+        readings = ", ".join(
+            f"{name}={value:g}" for name, value in record["sensor_readings"].items()
+        )
+        anomalies = ", ".join(
+            f"{name}={score:.2f}"
+            for name, score in record["anomaly_scores_standard_deviations"].items()
+        )
+        print(
+            f"\n{record['timestamp_utc']} | {record['source']} | {record['event']}\n"
+            f"  Readings: {readings}\n"
+            f"  Anomaly scores (standard deviations): {anomalies}\n"
+            f"  Failure estimate: {record['failure_probability']:.1%} | "
+            f"Health: {record['overall_health']:.1f}/100"
+        )
 
 
 def generate_sensor_data(num_samples: int = 500, failure_rate: float = 0.35) -> tuple[np.ndarray, np.ndarray]:
@@ -462,6 +560,7 @@ def interactive_menu(
 ) -> None:
     """Let the user inspect a sensor, overall health, all metrics, or new readings."""
     sample_interval_hours = 1.0
+    reading_source = "automated"
     while True:
         print("\nChoose what to inspect:")
         for index, name in enumerate(model.FEATURE_NAMES, start=1):
@@ -476,19 +575,27 @@ def interactive_menu(
         print("5. Overall engine health")
         print("6. All metrics and failure chart")
         print("7. Enter new sensor readings")
+        print("8. View audit history")
         print("0. Exit")
 
         choice = input("Selection: ").strip()
         if choice == "0":
             return
         if choice in {"1", "2", "3", "4"}:
+            sensor_index = int(choice) - 1
             print_sensor_reading(
                 model,
                 cleaner,
                 reading,
                 previous_reading,
-                int(choice) - 1,
+                sensor_index,
                 sample_interval_hours,
+            )
+            append_audit_record(
+                model,
+                reading,
+                reading_source,
+                f"sensor_inspection:{model.FEATURE_NAMES[sensor_index]}",
             )
         elif choice == "5":
             issues = cleaner.validate_numeric_reading(reading)
@@ -501,9 +608,11 @@ def interactive_menu(
             health = model.health_score(anomalies)
             print(f"Overall engine health: {health:.1f}/100")
             print(
-                f"Formula: 100 / (1 + average sensor deviation); "
-                f"average deviation is {np.mean(anomalies):.2f} standard deviations."
+                f"Formula: 100 / (1 + weighted mean standardized deviation); "
+                f"weighted deviation is "
+                f"{np.average(anomalies, weights=model.HEALTH_WEIGHTS):.2f}."
             )
+            append_audit_record(model, reading, reading_source, "overall_health")
         elif choice == "6":
             issues = cleaner.validate_numeric_reading(reading)
             previous_issues = cleaner.validate_numeric_reading(previous_reading)
@@ -553,6 +662,13 @@ def interactive_menu(
             else:
                 print("No sensor outliers or rapid deterioration detected.")
             print("Chart saved as failure_assessment.png")
+            append_audit_record(
+                model,
+                reading,
+                reading_source,
+                "all_metrics_assessment",
+                alerts,
+            )
         elif choice == "7":
             print("Enter current readings. Each shows its expected and physical ranges:")
             new_values = []
@@ -604,7 +720,16 @@ def interactive_menu(
             previous_reading = reading
             reading = new_reading
             sample_interval_hours = interval
+            reading_source = "user-entered"
             print(f"Reading updated. Trend interval: {interval:g} hour(s).")
+            append_audit_record(
+                model,
+                reading,
+                reading_source,
+                "manual_reading_entered",
+            )
+        elif choice == "8":
+            print_audit_history()
         else:
             print("Choose one of the listed menu options.")
 
@@ -641,6 +766,12 @@ def main() -> None:
 
     current_reading = np.array([4.8, 118.0, 30.0, 620.0])
     previous_reading = np.array([2.8, 95.0, 22.0, 600.0])
+    append_audit_record(
+        model,
+        current_reading,
+        "automated",
+        "automated_reading",
+    )
     interactive_menu(model, cleaner, current_reading, previous_reading)
 
 

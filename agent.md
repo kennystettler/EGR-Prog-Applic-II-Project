@@ -14,10 +14,12 @@ Check for outliers as long as getting rid of duplicates.
 
 Check for impossible reading that are outside of the range of the sensors.
 
-Add in a final overall health score of the engine by taking the average standard deviation of the engine parts and using that to determine overall health.
+Add in a final overall health score of the engine by taking the standard deviation of each engine part's sensor readings and standardizing them into a unified 0 to 100 health index. Because different sensors measure in completely different units and scales (such as temperature in degrees Celsius, vibration in millimeters per second, and current in Amps), raw standard deviations cannot be averaged directly; therefore, use NumPy to transform each metric into a standardized scale or Z-score before calculating a weighted average that assigns higher importance to critical safety components.
 
 Add in a menu that can help choose which reading they would like, along with an option for an overall health reading described above. Also allow the user to enter their own sensor data, but when the user is entering data, make sure there is a range in which the user should expect the sensor to be reading.
 
 If the user gives a number that is impossible to reach, give an error message in which tells the user it is likely an impossible number, but ask if they would like to run anyway, or enter a new number.
 
-If a check is ran that scans everything, prompt the user with information on which item is the reason for the faulure (if any). 
+If a check is ran that scans everything, prompt the user with information on which item is the reason for the faulure (if any).
+
+Add in persistent logging and an audit history that automatically records timestamps, user-entered or automated sensor inputs, anomaly detection scores, and overall engine health ratings into a local log file or data store. This allows operators and technicians to review historical degradation trends, track past diagnostic runs across shifts, and maintain a complete audit trail of machine performance over time.
